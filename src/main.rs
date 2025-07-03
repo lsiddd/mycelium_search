@@ -2,102 +2,87 @@
 //  Importações de Módulos e Bibliotecas (Crates)
 // ==============================================
 // Utilitários padrão do Rust
-use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::collections::{ HashMap, HashSet };
+use std::fs::{ self, File };
 use std::hash::BuildHasherDefault;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+// FIX: Removed `SeekFrom` as it was unused.
+use std::io::{ self, BufRead, BufReader, BufWriter, Seek, Write };
+use std::path::{ Path, PathBuf };
+use std::sync::atomic::{ AtomicUsize, Ordering };
 use std::sync::Mutex;
 use std::time::Instant;
 use std::cell::RefCell;
 
 // Bibliotecas de terceiros (externas)
-use clap::Parser; // MELHORIA: Usado para uma análise de argumentos CLI robusta.
-use indicatif::{ProgressBar, ProgressStyle}; // Para barras de progresso visuais.
-use itertools::Itertools; // Traz métodos extras para iteradores.
-use log::{info, warn, debug}; // Para registrar mensagens de log (info, warn, debug).
-use once_cell::sync::Lazy; // Para inicialização preguiçosa de estáticos.
-use rayon::prelude::*; // Traits para paralelismo com Rayon.
-use rayon::slice::ParallelSliceMut; // OTIMIZAÇÃO: Para ordenação paralela de slices.
-use regex::Regex; // Para compilação e uso de expressões regulares.
-use rust_stemmers::{Algorithm, Stemmer}; // Para o processo de stemming de palavras.
-use serde::{Deserialize, Serialize}; // Traits para serialização e desserialização.
-use zstd::stream::{Decoder, Encoder}; // Para compressão/descompressão com Zstandard.
+use clap::Parser;
+use indicatif::{ ProgressBar, ProgressStyle };
+use itertools::Itertools;
+// FIX: Removed `debug` as it was unused.
+use log::{ info, warn };
+use once_cell::sync::Lazy;
+use rayon::prelude::*;
+use rayon::slice::ParallelSliceMut;
+use regex::Regex;
+use rust_stemmers::{ Algorithm, Stemmer };
+use serde::{ Deserialize, Serialize };
+use zstd::stream::{ Decoder, Encoder };
+
+// Esta é a tecnologia central que nos permite acessar os dados do índice no disco
+// sem carregá-los inteiramente na memória RAM.
+use memmap2::Mmap;
 
 // ==============================
-//  Otimizações e Apelidos de Tipos (Type Aliases)
+//  Otimizações e Apelidos de Tipos
 // ==============================
-
-// OTIMIZAÇÃO: Usa o AHash, um algoritmo de hashing muito mais rápido, para todos os HashMaps.
-// Isso acelera significativamente as operações de inserção e busca em mapas de hash,
-// que são centrais para o desempenho do índice invertido.
 type AHashMap<K, V> = HashMap<K, V, BuildHasherDefault<ahash::AHasher>>;
 
 // ==============================
 //  Constantes e Variáveis Estáticas
 // ==============================
-// Constantes para o algoritmo de pontuação BM25.
-const K1: f64 = 1.5;  // Controla a saturação da frequência do termo (TF).
-const B: f64 = 0.75; // Controla o impacto do comprimento do documento na pontuação.
-
-// Define o tamanho do bloco (chunk) de linhas a serem processadas em paralelo.
-// Um bom tamanho de chunk balanceia a sobrecarga de agendamento de threads com a localidade de dados.
+const K1: f64 = 1.5;
+const B: f64 = 0.75;
 const CHUNK_SIZE: usize = 20_000;
 
-// Compila a expressão regular para tokenização apenas uma vez usando `Lazy`.
-// `Lazy` garante que a compilação cara do Regex aconteça apenas na primeira vez que for acessado.
-// O Regex divide o texto por espaços em branco ou pelos caracteres '|', ':', '/'.
-static TOKENIZER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\s:|/]+").unwrap());
-
-// `thread_local!` cria uma instância do `Stemmer` para cada thread.
-// Isso evita a necessidade de usar Mutexes para compartilhar o stemmer,
-// já que a estrutura `Stemmer` não é `Sync` (segura para compartilhamento entre threads).
-// `RefCell` permite mutabilidade interna de forma segura dentro de uma única thread.
 thread_local! {
     static STEMMER: RefCell<Stemmer> = RefCell::new(Stemmer::create(Algorithm::English));
 }
 
 // ==============================
-//  Estruturas de Dados do Índice
+//  Estruturas de Dados do Índice (em Memória e em Disco)
 // ==============================
-
-/// Define um identificador único para cada termo (palavra) no dicionário.
-/// Usar um `u32` é mais eficiente em termos de memória do que armazenar strings repetidamente.
 type TermId = u32;
 
-/// Representa a ocorrência de um termo em um documento específico.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+// REESTRUTURADO: Esta estrutura permanece a mesma, mas agora deve ser `Copy` para
+// podermos fazer "casts" de slices de bytes para slices dela de forma segura.
+// A anotação `#[repr(C)]` garante que o layout da memória seja previsível.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[repr(C)]
 struct TermPosting {
-    /// O ID do documento onde o termo aparece.
     doc_id: usize,
-    /// Uma lista de posições (índices de token) onde o termo ocorre dentro do documento.
-    positions: Vec<u32>,
+    // REESTRUTURADO: Para simplificar o formato em disco, o `TermPosting` não irá mais
+    // armazenar as posições diretamente. As posições serão armazenadas em um arquivo separado.
+    // Esta é uma simplificação para o exemplo, mas em um sistema real, você poderia ter um
+    // arquivo positions.dat e adicionar um `positions_offset` aqui.
+    // Por enquanto, vamos focar em resolver o problema da memória dos postings.
+    // A frequência do termo é o que o BM25 precisa, então vamos armazená-la.
+    term_frequency: u32,
 }
 
-/// Armazena metadados sobre cada documento (neste caso, cada linha de um arquivo).
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy)]
+#[repr(C)]
 struct DocumentMetadata {
-    /// O ID do arquivo ao qual este documento pertence (um índice na `file_table`).
     file_id: usize,
-    /// O número da linha dentro do arquivo original.
     line_number: usize,
-    /// O comprimento total do documento em número de tokens.
     doc_len: u32,
 }
 
-/// O dicionário de termos, que mapeia strings de termos para `TermId`s e vice-versa.
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct TermDictionary {
-    /// Mapeia uma string de termo (ex: "gato") para seu `TermId` (ex: 42).
-    map: AHashMap<String, TermId>, // OTIMIZAÇÃO: Usa AHashMap.
-    /// Mapeamento reverso: um vetor onde o índice é o `TermId` e o valor é a string do termo.
+    map: AHashMap<String, TermId>,
     rev_map: Vec<String>,
 }
 
 impl TermDictionary {
-    /// Obtém o `TermId` de um termo. Se o termo não existir, ele é inserido
-    /// no dicionário e um novo `TermId` é retornado.
     fn get_or_insert(&mut self, term: &str) -> TermId {
         if let Some(id) = self.map.get(term) {
             return *id;
@@ -109,68 +94,75 @@ impl TermDictionary {
     }
 }
 
-/// Uma "shard" (partição) do índice. O índice principal é dividido em várias shards
-/// para permitir a indexação e a busca em paralelo.
+// REESTRUTURADO: Esta é a estrutura que contém os metadados do índice.
+// Ela é PEQUENA e será carregada completamente na memória.
 #[derive(Debug, Serialize, Deserialize)]
-struct IndexShard {
-    /// O índice invertido para esta shard: mapeia `TermId` para uma lista de `TermPosting`s.
-    postings: AHashMap<TermId, Vec<TermPosting>>, // OTIMIZAÇÃO: Usa AHashMap.
-    /// Metadados para os documentos contidos nesta shard.
-    docs: AHashMap<usize, DocumentMetadata>, // OTIMIZAÇÃO: Usa AHashMap.
-    /// A soma dos comprimentos de todos os documentos nesta shard.
-    total_doc_len: u64,
-    /// O comprimento médio dos documentos nesta shard, usado no cálculo do BM25.
-    avg_doc_len: f64,
-}
-
-/// A estrutura principal do índice, que contém todas as shards e dados globais.
-#[derive(Debug, Serialize, Deserialize)]
-struct ShardedIndex {
-    /// O conjunto de todas as partições (shards) do índice.
-    shards: Vec<IndexShard>,
-    /// Uma tabela que mapeia um `file_id` para o caminho do arquivo (`PathBuf`).
+struct IndexMetadata {
     file_table: Vec<PathBuf>,
-    /// Um conjunto de "stop words" (palavras comuns como "o", "a", "de") a serem ignoradas.
     stop_words: HashSet<String>,
-    /// O número total de documentos em todo o índice.
     total_docs: usize,
-    /// O dicionário de termos global para todo o índice.
+    avg_doc_len: f64,
     term_dictionary: TermDictionary,
-    // OTIMIZAÇÃO: Armazena a frequência de documentos global para cada termo.
-    // Isso evita recalcular o IDF (Inverse Document Frequency) para cada busca,
-    // tornando as consultas muito mais rápidas.
     doc_frequencies: AHashMap<TermId, usize>,
 }
 
-impl ShardedIndex {
-    /// Cria um novo `ShardedIndex` vazio com um número especificado de shards.
-    pub fn new(num_shards: usize) -> Self {
-        let shards = (0..num_shards)
-            .map(|_| IndexShard {
-                postings: AHashMap::default(),
-                docs: AHashMap::default(),
-                total_doc_len: 0,
-                avg_doc_len: 0.0,
-            })
-            .collect();
+// REESTRUTURADO: O `ShardedIndex` antigo foi renomeado para `IndexBuilder`.
+// Seu único propósito agora é coletar todos os dados em memória durante a fase de indexação
+// antes de serem escritos no formato de disco pelo `IndexWriter`.
+#[derive(Debug)]
+struct IndexBuilder {
+    // Note: The types for these HashMaps will be inferred from their usage later
+    shards_postings: Vec<AHashMap<TermId, Vec<(usize, u32)>>>, // (doc_id, term_frequency)
+    shards_docs: Vec<AHashMap<usize, DocumentMetadata>>,
+    total_docs: AtomicUsize,
+    term_dictionary: Mutex<TermDictionary>,
+    file_table: Vec<PathBuf>,
+    stop_words: HashSet<String>,
+    num_shards: usize,
+}
 
-        ShardedIndex {
-            shards,
+// REESTRUTURADO: Introdução do `IndexReader`.
+// Esta estrutura representa um índice aberto para busca. Note como ela NÃO contém
+// as listas de postings. Em vez disso, ela tem mapeamentos de memória (`Mmap`)
+// para os arquivos no disco. Esta é a chave para o baixo uso de RAM.
+#[derive(Debug)]
+struct IndexReader {
+    metadata: IndexMetadata,
+    docs: Mmap,
+    postings: Mmap,
+    postings_offsets: Vec<u64>,
+}
+
+// REESTRUTURADO: Introdução do `IndexWriter`.
+// Responsável por pegar os dados coletados pelo `IndexBuilder` e escrevê-los
+// no formato de diretório de índice otimizado para o `IndexReader`.
+struct IndexWriter;
+
+// ==========================================================
+//  Implementação do `IndexBuilder` (Coleta de Dados)
+// ==========================================================
+impl IndexBuilder {
+    pub fn new(num_shards: usize) -> Self {
+        IndexBuilder {
+            shards_postings: (0..num_shards).map(|_| AHashMap::default()).collect(),
+            shards_docs: (0..num_shards).map(|_| AHashMap::default()).collect(),
+            total_docs: AtomicUsize::new(0),
+            term_dictionary: Mutex::new(TermDictionary::default()),
             file_table: Vec::new(),
             stop_words: Self::get_stop_words(),
-            total_docs: 0,
-            term_dictionary: TermDictionary::default(),
-            doc_frequencies: AHashMap::default(), // OTIMIZAÇÃO: Inicializa o mapa de frequências.
+            num_shards,
         }
     }
 
-    /// Indexa todos os arquivos `.txt` em um diretório especificado.
     pub fn index_directory(&mut self, dir_path: &Path) -> io::Result<()> {
         info!("Buscando arquivos .txt no diretório: {:?}", dir_path);
-        let files: Vec<_> = fs::read_dir(dir_path)?
+        let files: Vec<_> = fs
+            ::read_dir(dir_path)?
             .filter_map(Result::ok)
             .map(|entry| entry.path())
-            .filter(|path| path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("txt"))
+            .filter(
+                |path| path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("txt")
+            )
             .collect();
 
         self.file_table = files;
@@ -179,74 +171,64 @@ impl ShardedIndex {
         let pb = ProgressBar::new(self.file_table.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})")
+                .template(
+                    "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})"
+                )
                 .unwrap()
-                .progress_chars("#>-"),
+                .progress_chars("#>-")
         );
 
-        let doc_id_counter = AtomicUsize::new(0);
-        // Estrutura de dados temporária para coletar dados da indexação em paralelo.
-        // Cada thread trabalhará em sua própria entrada de `shard_data` para evitar contenção de locks.
-        let shard_data: Vec<_> = (0..self.shards.len())
-            .map(|_| {
-                Mutex::new((
-                    AHashMap::<TermId, Vec<TermPosting>>::default(), // Postings
-                    AHashMap::<usize, DocumentMetadata>::default(),  // Docs
-                    0u64,                                            // Total doc len
-                ))
-            })
+        type PostingsMap = AHashMap<TermId, Vec<(usize, u32)>>;
+        type DocsMap = AHashMap<usize, DocumentMetadata>;
+
+        let temp_shard_data: Vec<_> = (0..self.num_shards)
+            // Use `::default()` which provides the compiler with the full type information.
+            .map(|_| Mutex::new((PostingsMap::default(), DocsMap::default()))) // (postings, docs)
             .collect();
-        
-        let term_dictionary = Mutex::new(TermDictionary::default());
 
         for (file_id, path) in self.file_table.iter().enumerate() {
-            debug!("Processando arquivo: {:?}", path);
             if let Ok(file) = File::open(path) {
                 let reader = BufReader::new(file);
-
-                // Processa o arquivo em blocos (chunks) para melhor paralelismo e uso de memória.
-                for (chunk_idx, chunk) in reader.lines().chunks(CHUNK_SIZE).into_iter().enumerate() {
+                for (chunk_idx, chunk) in reader
+                    .lines()
+                    .chunks(CHUNK_SIZE)
+                    .into_iter()
+                    .enumerate() {
                     let lines_chunk: Vec<String> = chunk.filter_map(Result::ok).collect();
                     let base_line_num = chunk_idx * CHUNK_SIZE;
 
-                    // O coração do processamento paralelo: cada linha do chunk é processada em uma thread separada (pelo Rayon).
                     lines_chunk
                         .into_par_iter()
                         .enumerate()
                         .for_each(|(i, line)| {
-                            let doc_id = doc_id_counter.fetch_add(1, Ordering::Relaxed);
-                            let shard_index = doc_id % self.shards.len(); // Distribui documentos entre as shards.
+                            let doc_id = self.total_docs.fetch_add(1, Ordering::Relaxed);
+                            let shard_index = doc_id % self.num_shards;
                             let line_number = base_line_num + i + 1;
 
-                            // Usa o stemmer local da thread.
                             STEMMER.with(|stemmer_cell| {
                                 let stemmer = stemmer_cell.borrow();
                                 let tokens = self.tokenize_and_stem(&line, &stemmer);
                                 let doc_len = tokens.len() as u32;
 
-                                // Coleta as posições de cada termo no documento atual.
-                                let mut term_positions: AHashMap<TermId, Vec<u32>> = AHashMap::default();
-                                for (pos, token) in tokens.into_iter().enumerate() {
-                                    // Bloqueia o dicionário, insere o termo e obtém o ID.
+                                let mut term_counts: AHashMap<TermId, u32> = AHashMap::default();
+                                for token in tokens {
                                     let term_id = {
-                                        let mut dict = term_dictionary.lock().unwrap();
+                                        let mut dict = self.term_dictionary.lock().unwrap();
                                         dict.get_or_insert(&token)
                                     };
-                                    term_positions.entry(term_id).or_default().push(pos as u32);
+                                    *term_counts.entry(term_id).or_insert(0) += 1;
                                 }
 
-                                // Bloqueia os dados da shard correspondente e insere as informações do documento.
-                                let mut shard_lock = shard_data[shard_index].lock().unwrap();
-                                let (ref mut postings, ref mut docs, ref mut total_doc_len) = *shard_lock;
+                                let mut shard_lock = temp_shard_data[shard_index].lock().unwrap();
+                                let (ref mut postings, ref mut docs) = *shard_lock;
 
-                                *total_doc_len += doc_len as u64;
-                                docs.insert(doc_id, DocumentMetadata { file_id, line_number, doc_len });
-
-                                for (term_id, positions) in term_positions {
-                                    postings
-                                        .entry(term_id)
-                                        .or_default()
-                                        .push(TermPosting { doc_id, positions });
+                                docs.insert(doc_id, DocumentMetadata {
+                                    file_id,
+                                    line_number,
+                                    doc_len,
+                                });
+                                for (term_id, count) in term_counts {
+                                    postings.entry(term_id).or_default().push((doc_id, count));
                                 }
                             });
                         });
@@ -256,57 +238,331 @@ impl ShardedIndex {
             }
             pb.inc(1);
         }
-        pb.finish_with_message("Finalizando a indexação...");
+        pb.finish_with_message("Coleta de dados em memória concluída.");
 
-        // Mescla os dados temporários das shards e o dicionário na estrutura principal do índice.
-        self.term_dictionary = term_dictionary.into_inner().unwrap();
-        self.total_docs = doc_id_counter.load(Ordering::Relaxed);
-
-        info!("Mesclando dados das shards...");
-        for (i, shard_lock) in shard_data.into_iter().enumerate() {
-            let (postings, docs, total_doc_len) = shard_lock.into_inner().unwrap();
-            let num_docs = docs.len();
-            self.shards[i].postings = postings;
-            self.shards[i].docs = docs;
-            self.shards[i].total_doc_len = total_doc_len;
-            self.shards[i].avg_doc_len = if num_docs > 0 {
-                (total_doc_len as f64) / (num_docs as f64)
-            } else {
-                0.0
-            };
+        // Mesclar dados temporários
+        for (i, mutex) in temp_shard_data.into_iter().enumerate() {
+            let (postings, docs) = mutex.into_inner().unwrap();
+            self.shards_postings[i] = postings;
+            self.shards_docs[i] = docs;
         }
-
-        // OTIMIZAÇÃO PÓS-INDEXAÇÃO: Pré-calcula frequências globais e ordena as listas de postings.
-        // Este é um custo único na indexação que acelera muito as buscas.
-        info!("Calculando frequências de documentos e ordenando listas de postings...");
-        let mut doc_frequencies = AHashMap::default();
-        for shard in &mut self.shards {
-             shard.postings.par_iter_mut().for_each(|(&_term_id, postings)| {
-                // Ordenar por doc_id permite buscas binárias rápidas durante a consulta.
-                postings.sort_unstable_by_key(|p| p.doc_id);
-                // A agregação de frequências precisa ser feita após o loop paralelo.
-            });
-
-             for (&term_id, postings) in &shard.postings {
-                 *doc_frequencies.entry(term_id).or_insert(0) += postings.len();
-             }
-        }
-        self.doc_frequencies = doc_frequencies;
-        info!("Otimização do índice concluída.");
 
         Ok(())
     }
 
-    /// Realiza uma busca no índice com base em uma string de consulta.
+    // Métodos `tokenize_and_stem` e `get_stop_words` (com correção no stemmer)
+    fn tokenize_and_stem(&self, text: &str, stemmer: &Stemmer) -> Vec<String> {
+        static TOKEN_FINDER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\w.-]+").unwrap());
+        TOKEN_FINDER_REGEX.find_iter(text)
+            .map(|mat| mat.as_str().to_lowercase())
+            .filter(|s| !s.is_empty() && !self.stop_words.contains(s))
+            // FIX (E0308): Pass a reference `&s` instead of an owned `String` `s`.
+            .map(|s| stemmer.stem(&s).into_owned())
+            .collect()
+    }
+
+    fn get_stop_words() -> HashSet<String> {
+        [
+            "a",
+            "an",
+            "the",
+            "in",
+            "on",
+            "of",
+            "for",
+            "to",
+            "with",
+            "is",
+            "are",
+            "was",
+            "were",
+            "at",
+            "by",
+            "be",
+            "been",
+            "being",
+            "have",
+            "has",
+            "had",
+            "do",
+            "does",
+            "did",
+            "will",
+            "would",
+            "should",
+            "can",
+            "could",
+            "may",
+            "might",
+            "must",
+            "i",
+            "you",
+            "he",
+            "she",
+            "it",
+            "we",
+            "they",
+            "me",
+            "him",
+            "her",
+            "us",
+            "them",
+            "my",
+            "your",
+            "his",
+            "its",
+            "our",
+            "their",
+            "this",
+            "that",
+            "these",
+            "those",
+            "am",
+        ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+}
+
+// ==========================================================
+//  Implementação do `IndexWriter` (Escrita para o Disco)
+// ==========================================================
+
+impl IndexWriter {
+    pub fn write(builder: IndexBuilder, index_path: &Path) -> io::Result<()> {
+        if index_path.exists() {
+            fs::remove_dir_all(index_path)?;
+        }
+        fs::create_dir_all(index_path)?;
+        info!("Iniciando a escrita do índice no diretório: {:?}", index_path);
+
+        let total_docs = builder.total_docs.load(Ordering::Relaxed);
+        let term_dictionary = builder.term_dictionary.into_inner().unwrap();
+        let num_terms = term_dictionary.rev_map.len();
+
+        // 1. Mesclar documentos e calcular o comprimento médio e as frequências de documentos
+        info!("Mesclando metadados dos documentos...");
+        let mut all_docs =
+            vec![DocumentMetadata { file_id: 0, line_number: 0, doc_len: 0 }; total_docs];
+        let mut total_doc_len_sum: u64 = 0;
+        for shard_docs in builder.shards_docs {
+            for (doc_id, metadata) in shard_docs {
+                all_docs[doc_id] = metadata;
+                total_doc_len_sum += metadata.doc_len as u64;
+            }
+        }
+        let avg_doc_len = if total_docs > 0 {
+            (total_doc_len_sum as f64) / (total_docs as f64)
+        } else {
+            0.0
+        };
+
+        // Escrever o arquivo de metadados dos documentos (`docs.dat`)
+        let docs_path = index_path.join("docs.dat");
+        let mut docs_file = BufWriter::new(File::create(&docs_path)?);
+        // REESTRUTURADO: Usamos `as_bytes` para uma escrita de baixo nível, muito mais rápida
+        // do que a serialização individual. Isso é seguro por causa do `#[repr(C)]`.
+        let docs_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                all_docs.as_ptr() as *const u8,
+                all_docs.len() * std::mem::size_of::<DocumentMetadata>()
+            )
+        };
+        docs_file.write_all(docs_bytes)?;
+        info!("Arquivo de metadados de documentos salvo em {:?}", docs_path);
+
+        // 2. Mesclar postings, ordenar por doc_id e calcular frequências
+        info!("Mesclando e ordenando listas de postings...");
+        let mut all_postings: Vec<Vec<TermPosting>> = vec![Vec::new(); num_terms];
+        let mut doc_frequencies = AHashMap::default();
+        for shard_postings in builder.shards_postings {
+            for (term_id, postings) in shard_postings {
+                let term_postings = all_postings.get_mut(term_id as usize).unwrap();
+                for (doc_id, tf) in postings {
+                    term_postings.push(TermPosting { doc_id, term_frequency: tf });
+                }
+            }
+        }
+
+        // Ordenar postings em paralelo e calcular frequências
+        all_postings
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(_term_id, postings)| {
+                postings.sort_unstable_by_key(|p| p.doc_id);
+                // Esta parte da frequência precisa ser feita em um segundo passo single-threaded.
+            });
+        for (term_id, postings) in all_postings.iter().enumerate() {
+            if !postings.is_empty() {
+                doc_frequencies.insert(term_id as TermId, postings.len());
+            }
+        }
+
+        // 3. Escrever os arquivos de postings (`postings.dat`) e offsets (`postings.off`)
+        let postings_path = index_path.join("postings.dat");
+        let offsets_path = index_path.join("postings.off");
+        let mut postings_file = BufWriter::new(File::create(&postings_path)?);
+        let mut offsets_file = BufWriter::new(File::create(&offsets_path)?);
+        let mut postings_offsets = vec![0u64; num_terms];
+
+        info!("Escrevendo arquivos de postings e offsets...");
+        for (term_id, postings) in all_postings.iter().enumerate() {
+            if postings.is_empty() {
+                continue;
+            }
+            let offset = postings_file.stream_position()?;
+            postings_offsets[term_id] = offset;
+
+            // Escreve os postings como um bloco de bytes
+            let postings_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    postings.as_ptr() as *const u8,
+                    postings.len() * std::mem::size_of::<TermPosting>()
+                )
+            };
+            postings_file.write_all(postings_bytes)?;
+        }
+
+        // Escrever os offsets
+        let offsets_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                postings_offsets.as_ptr() as *const u8,
+                postings_offsets.len() * std::mem::size_of::<u64>()
+            )
+        };
+        offsets_file.write_all(offsets_bytes)?;
+        info!("Arquivos de postings e offsets salvos em {:?} e {:?}", postings_path, offsets_path);
+
+        // 4. Escrever o arquivo principal de metadados (`meta.bin`)
+        let metadata = IndexMetadata {
+            file_table: builder.file_table,
+            stop_words: builder.stop_words,
+            total_docs,
+            avg_doc_len,
+            term_dictionary,
+            doc_frequencies,
+        };
+
+        let meta_path = index_path.join("meta.bin");
+        let meta_file = File::create(&meta_path)?;
+        let buffered_writer = BufWriter::new(meta_file);
+        let mut encoder = Encoder::new(buffered_writer, 3)?;
+        // FIX (E0277): Manually map the bincode error to an io::Error.
+        bincode
+            ::serialize_into(&mut encoder, &metadata)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        encoder.finish()?;
+        info!("Arquivo de metadados principal salvo em {:?}", meta_path);
+
+        Ok(())
+    }
+}
+
+// ==========================================================
+//  Implementação do `IndexReader` (Busca com mmap)
+// ==========================================================
+impl IndexReader {
+    // REESTRUTURADO: A nova função `load` agora é `open`, para refletir que não estamos
+    // carregando tudo, mas sim abrindo os arquivos para acesso.
+    pub fn open(index_path: &Path) -> io::Result<Self> {
+        info!("Abrindo o índice de {:?}. Apenas metadados serão carregados na RAM.", index_path);
+
+        // 1. Carregar o arquivo de metadados (pequeno)
+        let meta_path = index_path.join("meta.bin");
+        let meta_file = File::open(&meta_path)?;
+        let buffered_reader = BufReader::new(meta_file);
+        let decoder = Decoder::new(buffered_reader)?;
+        let metadata: IndexMetadata = bincode
+            ::deserialize_from(decoder)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // 2. Carregar o arquivo de offsets dos postings (relativamente pequeno)
+        let offsets_path = index_path.join("postings.off");
+        let offsets_data = fs::read(offsets_path)?;
+        let postings_offsets: Vec<u64> = unsafe {
+            let mut vec = Vec::with_capacity(offsets_data.len() / std::mem::size_of::<u64>());
+            let ptr = offsets_data.as_ptr() as *const u64;
+            vec.set_len(offsets_data.len() / std::mem::size_of::<u64>());
+            std::ptr::copy_nonoverlapping(ptr, vec.as_mut_ptr(), vec.len());
+            vec
+        };
+
+        // 3. Mapear em memória os arquivos grandes (docs e postings)
+        let docs_path = index_path.join("docs.dat");
+        let docs_file = File::open(&docs_path)?;
+        let docs = unsafe { Mmap::map(&docs_file)? };
+
+        let postings_path = index_path.join("postings.dat");
+        let postings_file = File::open(&postings_path)?;
+        let postings = unsafe { Mmap::map(&postings_file)? };
+
+        info!("Índice aberto com sucesso. Prótons para busca.");
+
+        Ok(IndexReader {
+            metadata,
+            docs,
+            postings,
+            postings_offsets,
+        })
+    }
+
+    // REESTRUTURADO: Obtém a lista de postings de um termo. Em vez de um lookup em HashMap,
+    // ele encontra o slice de bytes relevante no arquivo mapeado em memória e o
+    // converte para um slice de `&[TermPosting]`. Isso é extremamente rápido e não aloca memória.
+    fn get_postings_for_term(&self, term_id: TermId) -> Option<&[TermPosting]> {
+        let term_idx = term_id as usize;
+        if term_idx >= self.postings_offsets.len() {
+            return None;
+        }
+
+        let start_offset = self.postings_offsets[term_idx] as usize;
+
+        // FIX: Removed the unused `end_offset` variable and its logic block.
+        // The second `end_offset` declaration correctly handles finding the next valid offset.
+        // Encontra o primeiro offset não-zero a partir do proximo
+        let end_offset = self.postings_offsets
+            .get(term_idx + 1..)?
+            .iter()
+            .find(|&&offset| offset > 0)
+            .map(|&offset| offset as usize)
+            .unwrap_or(self.postings.len());
+
+        if start_offset >= end_offset {
+            return None;
+        }
+
+        let postings_bytes = &self.postings[start_offset..end_offset];
+        let postings: &[TermPosting] = unsafe {
+            std::slice::from_raw_parts(
+                postings_bytes.as_ptr() as *const TermPosting,
+                postings_bytes.len() / std::mem::size_of::<TermPosting>()
+            )
+        };
+        Some(postings)
+    }
+
+    // REESTRUTURADO: Obtém os metadados de um documento específico.
+    fn get_doc_metadata(&self, doc_id: usize) -> Option<&DocumentMetadata> {
+        let size = std::mem::size_of::<DocumentMetadata>();
+        let start = doc_id * size;
+        let end = start + size;
+        if end > self.docs.len() {
+            return None;
+        }
+        let doc_bytes = &self.docs[start..end];
+        let doc: &DocumentMetadata = unsafe { &*(doc_bytes.as_ptr() as *const DocumentMetadata) };
+        Some(doc)
+    }
+
     pub fn search(&self, query: &str) -> Vec<(PathBuf, usize, f64)> {
         let stemmer = Stemmer::create(Algorithm::English);
         let query_token_strings = self.tokenize_and_stem(query, &stemmer);
 
-        // Converte os tokens da consulta para seus TermIds, removendo duplicatas e tokens não encontrados.
         let query_token_ids: Vec<TermId> = query_token_strings
             .iter()
-            .filter_map(|token| self.term_dictionary.map.get(token).copied())
-            .collect::<HashSet<_>>() // Garante tokens únicos
+            .filter_map(|token| self.metadata.term_dictionary.map.get(token).copied())
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
 
@@ -314,217 +570,133 @@ impl ShardedIndex {
             info!("Nenhum termo da consulta foi encontrado no dicionário.");
             return Vec::new();
         }
-        debug!("IDs dos termos da consulta: {:?}", query_token_ids);
 
-        // OTIMIZAÇÃO: Pré-calcula o IDF para cada termo da consulta uma única vez.
         let idf_map: AHashMap<TermId, f64> = query_token_ids
             .par_iter()
             .map(|&term_id| {
-                let doc_freq = self.doc_frequencies.get(&term_id).copied().unwrap_or(0);
+                let doc_freq = self.metadata.doc_frequencies.get(&term_id).copied().unwrap_or(0);
                 (term_id, self.calculate_idf(doc_freq))
             })
             .collect();
 
-        // Executa a busca em paralelo em todas as shards.
-        let all_results: Vec<_> = self.shards
-            .par_iter()
-            .flat_map(|shard| {
-                let mut doc_scores: AHashMap<usize, f64> = AHashMap::default();
-
-                // 1. Calcula as pontuações BM25 para cada documento relevante.
-                for &token_id in &query_token_ids {
-                    if let (Some(postings), Some(idf)) = (shard.postings.get(&token_id), idf_map.get(&token_id)) {
-                        for posting in postings {
-                            let score = self.calculate_bm25(posting, *idf, shard);
-                            *doc_scores.entry(posting.doc_id).or_insert(0.0) += score;
-                        }
-                    }
-                }
-
-                // 2. Para cada documento pontuado, calcula o "boost" de proximidade e combina as pontuações.
-                doc_scores
-                    .into_iter()
-                    .map(|(doc_id, bm25_score)| {
-                        let proximity_boost = self.calculate_proximity_score(doc_id, &query_token_ids, shard);
-                        let metadata = &shard.docs[&doc_id];
-                        let file_path = self.file_table[metadata.file_id].clone();
-                        // Pontuação final = BM25 * (1 + Boost de Proximidade)
-                        let final_score = bm25_score * (1.0 + proximity_boost);
-                        (file_path, metadata.line_number, final_score)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        let mut final_results = all_results;
-        // OTIMIZAÇÃO: Usa uma ordenação paralela para grandes conjuntos de resultados.
-        final_results.par_sort_unstable_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        final_results
-    }
-    
-    /// Calcula a pontuação BM25 para um termo em um documento.
-    fn calculate_bm25(&self, posting: &TermPosting, idf: f64, shard: &IndexShard) -> f64 {
-        let doc_len = shard.docs[&posting.doc_id].doc_len as f64;
-        let tf = posting.positions.len() as f64; // Term Frequency
-        let numerator = tf * (K1 + 1.0);
-        let denominator = tf + K1 * (1.0 - B + B * (doc_len / shard.avg_doc_len));
-        idf * (numerator / denominator)
-    }
-
-    /// Calcula o IDF (Inverse Document Frequency) usando a frequência global pré-calculada.
-    fn calculate_idf(&self, doc_freq: usize) -> f64 {
-        let total_docs = self.total_docs as f64;
-        // Usa a variante BM25+ do IDF, que é mais estável.
-        ((total_docs - (doc_freq as f64) + 0.5) / ((doc_freq as f64) + 0.5) + 1.0).ln()
-    }
-    
-    /// Calcula uma pontuação de proximidade baseada na menor distância entre os termos da consulta em um documento.
-    /// Documentos onde os termos da consulta aparecem próximos recebem uma pontuação maior.
-    fn calculate_proximity_score(&self, doc_id: usize, query_token_ids: &[TermId], shard: &IndexShard) -> f64 {
-        if query_token_ids.len() < 2 {
-            return 0.0; // Não há proximidade a ser calculada com menos de dois termos.
-        }
-
-        let mut positions_with_terms: Vec<(u32, TermId)> = Vec::new();
-        for &token_id in query_token_ids {
-            if let Some(postings) = shard.postings.get(&token_id) {
-                // OTIMIZAÇÃO: Usa busca binária nas listas de postings pré-ordenadas para encontrar o doc_id rapidamente.
-                if let Ok(idx) = postings.binary_search_by_key(&doc_id, |p| p.doc_id) {
-                    let posting = &postings[idx];
-                    positions_with_terms.extend(posting.positions.iter().map(|&pos| (pos, token_id)));
+        // A busca agora itera sobre os termos e acessa os postings via mmap.
+        let mut doc_scores: AHashMap<usize, f64> = AHashMap::default();
+        for &token_id in &query_token_ids {
+            if
+                let (Some(postings), Some(idf)) = (
+                    self.get_postings_for_term(token_id),
+                    idf_map.get(&token_id),
+                )
+            {
+                for posting in postings {
+                    let score = self.calculate_bm25(posting, *idf);
+                    *doc_scores.entry(posting.doc_id).or_insert(0.0) += score;
                 }
             }
         }
 
-        if positions_with_terms.len() < 2 {
-            return 0.0;
-        }
+        // REESTRUTURADO: A lógica de ranking de proximidade precisaria ser readaptada
+        // para um novo formato de arquivo de posições. Para manter este exemplo focado
+        // no problema de memória, a busca por proximidade foi removida temporariamente.
+        // Adicioná-la de volta envolveria criar um `positions.dat` e `positions.off`.
 
-        // Ordena todos os termos encontrados pela sua posição no documento.
-        positions_with_terms.sort_unstable_by_key(|k| k.0);
-        
-        // Encontra a distância mínima entre duas janelas de termos *diferentes*.
-        let min_dist = positions_with_terms
-            .windows(2)
-            .filter_map(|w| {
-                if w[0].1 != w[1].1 { // Compara por TermId para garantir que são termos diferentes.
-                    Some(w[1].0 - w[0].0)
-                } else {
-                    None
-                }
+        let mut all_results: Vec<_> = doc_scores
+            .into_par_iter()
+            .filter_map(|(doc_id, score)| {
+                self.get_doc_metadata(doc_id).map(|metadata| {
+                    let file_path = self.metadata.file_table[metadata.file_id].clone();
+                    (file_path, metadata.line_number, score)
+                })
             })
-            .min()
-            .unwrap_or(u32::MAX);
+            .collect();
 
-        if min_dist == u32::MAX {
-            0.0 // Nenhum par de termos diferentes foi encontrado.
-        } else {
-            // A pontuação é inversamente proporcional à distância.
-            1.0 / ((min_dist as f64) + 1.0)
-        }
+        all_results.par_sort_unstable_by(|a, b|
+            b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
+        );
+        all_results
     }
 
-    /// Processa uma string de texto: tokeniza, remove pontuação, converte para minúsculas, remove stop words e aplica stemming.
-    fn tokenize_and_stem<'a>(&self, text: &'a str, stemmer: &'a Stemmer) -> Vec<String> {
-        TOKENIZER_REGEX.split(text)
-            .map(|s| s.trim_matches(|p: char| !p.is_alphanumeric()).to_lowercase())
-            .filter(|s| !s.is_empty() && !self.stop_words.contains(s))
+    fn calculate_bm25(&self, posting: &TermPosting, idf: f64) -> f64 {
+        let doc_metadata = self.get_doc_metadata(posting.doc_id).unwrap();
+        let doc_len = doc_metadata.doc_len as f64;
+        let tf = posting.term_frequency as f64;
+        let numerator = tf * (K1 + 1.0);
+        let denominator = tf + K1 * (1.0 - B + B * (doc_len / self.metadata.avg_doc_len));
+        idf * (numerator / denominator)
+    }
+
+    fn calculate_idf(&self, doc_freq: usize) -> f64 {
+        let total_docs = self.metadata.total_docs as f64;
+        ((total_docs - (doc_freq as f64) + 0.5) / ((doc_freq as f64) + 0.5) + 1.0).ln()
+    }
+
+    // Métodos `tokenize_and_stem` e `get_stop_words` (com correção no stemmer)
+    fn tokenize_and_stem(&self, text: &str, stemmer: &Stemmer) -> Vec<String> {
+        static TOKEN_FINDER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"[\w.-]+").unwrap());
+        TOKEN_FINDER_REGEX.find_iter(text)
+            .map(|mat| mat.as_str().to_lowercase())
+            .filter(|s| !s.is_empty() && !self.metadata.stop_words.contains(s))
+            // FIX (E0308): Pass a reference `&s` instead of an owned `String` `s`.
             .map(|s| stemmer.stem(&s).into_owned())
             .collect()
     }
-
-    /// Retorna um HashSet com uma lista de stop words em inglês.
-    fn get_stop_words() -> HashSet<String> {
-        [
-            "a", "an", "the", "in", "on", "of", "for", "to", "with", "is", "are", "was",
-            "were", "at", "by", "be", "been", "being", "have", "has", "had", "do",
-            "does", "did", "will", "would", "should", "can", "could", "may", "might",
-            "must", "i", "you", "he", "she", "it", "we", "they", "me", "him", "her",
-            "us", "them", "my", "your", "his", "its", "our", "their", "this", "that",
-            "these", "those", "am",
-        ].iter().map(|s| s.to_string()).collect()
-    }
-
-    /// Salva o estado atual do índice em um arquivo, usando compressão zstd.
-    fn save(&self, index_path: &Path) -> io::Result<()> {
-        let file = File::create(index_path)?;
-        let buffered_writer = BufWriter::new(file);
-        // Nível de compressão 3 é um bom equilíbrio entre velocidade e taxa de compressão.
-        let mut encoder = Encoder::new(buffered_writer, 3)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        bincode::serialize_into(&mut encoder, self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        encoder.finish()?;
-        Ok(())
-    }
-
-    /// Carrega um índice de um arquivo, descomprimindo com zstd.
-    fn load(index_path: &Path) -> io::Result<Self> {
-        let file = File::open(index_path)?;
-        let buffered_reader = BufReader::new(file);
-        let decoder = Decoder::new(buffered_reader)?;
-        bincode::deserialize_from(decoder)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
-    }
 }
 
-/// Função auxiliar para ler uma linha específica de um arquivo.
 fn get_line_from_file(file_path: &Path, line_number: usize) -> io::Result<Option<String>> {
     if line_number == 0 {
         return Ok(None);
     }
     let file = File::open(file_path)?;
     let reader = BufReader::new(file);
-    // `.nth()` é O(n), mas para exibir resultados é aceitável.
-    Ok(reader.lines().nth(line_number - 1).transpose()?)
+    Ok(
+        reader
+            .lines()
+            .nth(line_number - 1)
+            .transpose()?
+    )
 }
 
 // ==============================
 //  Lógica Principal da Aplicação (CLI)
 // ==============================
 
-/// Mycelium: Uma ferramenta de busca de texto completo em Rust, rápida e multithreaded.
+// Definições de `Cli` e `Commands` permanecem as mesmas.
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None, help_template = "\
+#[command(
+    author,
+    version,
+    about,
+    long_about = None,
+    help_template = "\
 {name} {version}
 {author-with-newline}
 {about-with-newline}
 {usage-heading} {usage}
 
 {all-args}
-")]
+"
+)]
 struct Cli {
-    /// Aumenta o nível de verbosidade. Use -v para INFO, -vv para DEBUG.
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
-
     #[command(subcommand)]
     command: Commands,
 }
 
 #[derive(Parser, Debug)]
 enum Commands {
-    /// Indexa um diretório de arquivos de texto (.txt).
     Index {
-        /// O caminho para o diretório a ser indexado.
         #[arg(value_name = "DIRETÓRIO")]
         dir_path: PathBuf,
-
-        /// [Opcional] O caminho para salvar o arquivo de índice.
-        #[arg(short, long, value_name = "ARQUIVO_DE_ÍNDICE", default_value = "index.bin")]
+        // REESTRUTURADO: O output agora é um diretório, não um arquivo.
+        #[arg(short, long, value_name = "DIRETÓRIO_DE_ÍNDICE", default_value = "index.myc")]
         output: PathBuf,
     },
-    /// Procura por uma consulta em um arquivo de índice existente.
     Search {
-        /// A consulta de pesquisa a ser executada.
         #[arg(value_name = "CONSULTA")]
         query: String,
-
-        /// [Opcional] O caminho para o arquivo de índice a ser usado.
-        #[arg(short, long, value_name = "ARQUIVO_DE_ÍNDICE", default_value = "index.bin")]
-        index_file: PathBuf,
-
-        /// [Opcional] Salva os resultados em um arquivo em vez de imprimir no console.
+        #[arg(short, long, value_name = "DIRETÓRIO_DE_ÍNDICE", default_value = "index.myc")]
+        index_path: PathBuf,
         #[arg(short, long, value_name = "ARQUIVO_DE_SAÍDA")]
         output: Option<PathBuf>,
     },
@@ -532,57 +704,66 @@ enum Commands {
 
 fn main() -> io::Result<()> {
     let cli = Cli::parse();
-
-    // Configura o logger com base na flag de verbosidade -v.
+    // Configuração do logger (sem alterações)
     let log_level = match cli.verbose {
-        0 => log::LevelFilter::Warn,  // Padrão: mostra apenas avisos e erros.
-        1 => log::LevelFilter::Info,  // -v: mostra informações gerais.
-        _ => log::LevelFilter::Debug, // -vv, -vvv, etc.: mostra informações de depuração.
+        0 => log::LevelFilter::Warn,
+        1 => log::LevelFilter::Info,
+        _ => log::LevelFilter::Debug,
     };
-    env_logger::Builder::new()
-        .filter_level(log_level)
-        .format_timestamp_secs()
-        .init();
+    env_logger::Builder::new().filter_level(log_level).format_timestamp_secs().init();
 
     match cli.command {
         Commands::Index { dir_path, output } => {
             let num_shards = num_cpus::get();
             info!("Iniciando indexação com {} shards (núcleos de CPU)...", num_shards);
             let start = Instant::now();
-            let mut index = ShardedIndex::new(num_shards);
-            index.index_directory(&dir_path)?;
-            info!("Processamento dos dados de indexação concluído em {:?}.", start.elapsed());
+            let mut builder = IndexBuilder::new(num_shards);
+            builder.index_directory(&dir_path)?;
+            info!("Coleta de dados em memória concluída em {:?}.", start.elapsed());
 
-            let save_start = Instant::now();
-            index.save(&output)?;
-            let final_size = fs::metadata(&output)?.len();
+            let write_start = Instant::now();
+            IndexWriter::write(builder, &output)?;
+            // REESTRUTURADO: Calcular o tamanho total do diretório do índice.
+            let total_size: u64 = fs
+                ::read_dir(&output)?
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.metadata().ok())
+                .filter(|metadata| metadata.is_file())
+                .map(|metadata| metadata.len())
+                .sum();
+
             println!(
-                "Índice salvo em {:?} (Tamanho: {:.2} MB) em {:?}.",
+                "Índice salvo em {:?} (Tamanho total: {:.2} MB) em {:?}.",
                 output,
-                (final_size as f64) / 1_048_576.0, // Bytes para Megabytes
-                save_start.elapsed()
+                (total_size as f64) / 1_048_576.0,
+                write_start.elapsed()
             );
         }
-        Commands::Search { query, index_file, output } => {
-            if !index_file.exists() {
+        Commands::Search { query, index_path, output } => {
+            // REESTRUTURADO: Verificar se o diretório do índice (ou o meta.bin) existe.
+            if !index_path.join("meta.bin").exists() {
                 eprintln!(
-                    "Erro: Arquivo de índice não encontrado em {:?}. Por favor, execute o comando 'index' primeiro.",
-                    index_file
+                    "Erro: Diretório de índice inválido ou não encontrado em {:?}. Por favor, execute o comando 'index' primeiro.",
+                    index_path
                 );
                 return Ok(());
             }
 
-            info!("Carregando índice de {:?}...", index_file);
             let load_start = Instant::now();
-            let index = ShardedIndex::load(&index_file)?;
-            info!("Índice carregado em {:?}.", load_start.elapsed());
+            // REESTRUTURADO: Usa o IndexReader para abrir o índice.
+            let index_reader = IndexReader::open(&index_path)?;
+            info!(
+                "Índice aberto em {:?} (operação de baixo custo de memória).",
+                load_start.elapsed()
+            );
 
             info!("Buscando por: '{}'", query);
             let search_start = Instant::now();
-            let results = index.search(&query);
+            let results = index_reader.search(&query);
             let search_duration = search_start.elapsed();
-            
-            // Se um caminho de saída foi fornecido, salva os resultados em um arquivo.
+
+            // Lógica de exibição/salvamento de resultados (sem grandes alterações)
+            // ... (o código restante da função main é praticamente idêntico)
             if let Some(out_path) = output {
                 println!(
                     "Encontrados {} resultados em {:?}. Salvando em {}...",
@@ -590,19 +771,14 @@ fn main() -> io::Result<()> {
                     search_duration,
                     out_path.display()
                 );
-
                 let file = File::create(&out_path)?;
                 let mut writer = BufWriter::new(file);
-
                 writeln!(writer, "Resultados da busca para a consulta: '{}'", query)?;
                 writeln!(writer, "Encontrados {} resultados.\n", results.len())?;
-
                 for (file_path, line_number, score) in results.iter() {
-                    let line_content = get_line_from_file(file_path, *line_number)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| "[Não foi possível ler a linha]".to_string());
-                    
+                    let line_content = get_line_from_file(file_path, *line_number)?.unwrap_or_else(
+                        || "[Não foi possível ler a linha]".to_string()
+                    );
                     writeln!(
                         writer,
                         "Pontuação: {:.4}, Arquivo: \"{}\", Linha: {}\n > {}\n",
@@ -613,18 +789,18 @@ fn main() -> io::Result<()> {
                     )?;
                 }
                 println!("Resultados salvos com sucesso em {}.", out_path.display());
-
             } else {
-                // Comportamento padrão: imprime os melhores resultados no console.
                 if !results.is_empty() {
-                    println!("\nEncontrados {} resultados em {:?}:", results.len(), search_duration);
-                    // Mostra os 10 melhores resultados.
+                    println!(
+                        "\nEncontrados {} resultados em {:?}:",
+                        results.len(),
+                        search_duration
+                    );
                     for (file_path, line_number, score) in results.iter().take(10) {
-                        let line_content = get_line_from_file(file_path, *line_number)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(|| "[Não foi possível ler a linha]".to_string());
-                        
+                        let line_content = get_line_from_file(
+                            file_path,
+                            *line_number
+                        )?.unwrap_or_else(|| "[Não foi possível ler a linha]".to_string());
                         println!(
                             "  - Pontuação: {:.4}, Arquivo: \"{}\", Linha: {}",
                             score,

@@ -57,3 +57,4 @@ env_logger = "0.10"
 # MELHORIA: Analisador de argumentos de linha de comando rico em recursos, declarativo e robusto.
 # Usado para criar uma CLI amigável com subcomandos e a flag de verbosidade (-v).
 clap = { version = "4.0", features = ["derive"] }
+memmap2 = "0.9" 
