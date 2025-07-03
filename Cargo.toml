@@ -1,22 +1,59 @@
+# -*- mode: toml; -*-
+
+# ========================================================================================
+#  CONFIGURAÇÃO DO PACOTE (PACKAGE) MYCELIUM
+# ========================================================================================
+# Esta seção define informações essenciais sobre o "crate" (pacote) Rust,
+# como seu nome, versão e a edição do Rust utilizada.
+# ========================================================================================
 [package]
 name = "mycelium"
-version = "0.7.0"
+version = "0.7.1" # Versão atualizada para refletir as novas funcionalidades e melhorias.
 edition = "2021"
 
-# --- Dependencies ---
+# ========================================================================================
+#  DEPENDÊNCIAS
+# ========================================================================================
+# Esta seção lista todas as bibliotecas externas ("crates") que o projeto utiliza.
+# Cada uma desempenha um papel específico, desde a serialização de dados até a
+# otimização de performance e criação de interfaces de linha de comando.
+# ========================================================================================
 [dependencies]
+# --- Serialização e Dados ---
+# Permite a conversão de estruturas de dados Rust para e de formatos como JSON, etc.
+# A feature "derive" gera automaticamente o código necessário para a serialização.
 serde = { version = "1.0", features = ["derive"] }
+# Para serialização e desserialização binária de alta performance. Usado para salvar e carregar o índice.
 bincode = "1.3"
-rayon = "1.5"
-indicatif = "0.17"
-rust-stemmers = "1.2"
-num_cpus = "1.13"
-regex = "1.5"
-itertools = "0.12"
-once_cell = "1.19"
-zstd = "0.13" 
+# Para compressão e descompressão de dados usando o algoritmo Zstandard.
+# Reduz drasticamente o tamanho do arquivo de índice no disco.
+zstd = "0.13"
 
-# Added for major performance improvements
-ahash = "0.8"       # A faster, non-cryptographic hasher for our HashMaps
-log = "0.4"         # Logging facade
-env_logger = "0.10" # A logger implementation
+# --- Processamento Paralelo e Performance ---
+# Biblioteca para paralelismo de dados fácil e poderoso. Essencial para acelerar a indexação e a busca.
+rayon = "1.5"
+# Um hasher não criptográfico extremamente rápido para HashMaps, melhorando a performance de lookups.
+ahash = "0.8"
+# Fornece o número de CPUs lógicas disponíveis no sistema, usado para configurar o número de shards.
+num_cpus = "1.13"
+
+# --- Ferramentas e Utilitários ---
+# Para criar barras de progresso ricas e informativas no terminal.
+indicatif = "0.17"
+# Implementação de algoritmos de "stemming" (radicalização) para normalizar palavras.
+rust-stemmers = "1.2"
+# Biblioteca poderosa para trabalhar com expressões regulares (regex), usada na tokenização.
+regex = "1.5"
+# Estende os iteradores do Rust com uma variedade de métodos úteis.
+itertools = "0.12"
+# Permite a inicialização segura e única de estáticos globais, como o nosso Regex de tokenização.
+once_cell = "1.19"
+
+# --- Logging e Interface de Linha de Comando (CLI) ---
+# Uma "fachada" de logging, uma API comum para registrar eventos em diferentes backends.
+log = "0.4"
+# Uma implementação de logger que se integra com a fachada `log` e pode ser configurada por variáveis de ambiente.
+env_logger = "0.10"
+# MELHORIA: Analisador de argumentos de linha de comando rico em recursos, declarativo e robusto.
+# Usado para criar uma CLI amigável com subcomandos e a flag de verbosidade (-v).
+clap = { version = "4.0", features = ["derive"] }
